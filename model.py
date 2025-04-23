@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import math
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 @dataclass
 class GPTConfig:
@@ -37,13 +37,13 @@ class CausalSelfAttention(nn.Module):
     """masked multihead attention"""
     def __init__(self, config: GPTConfig):
         super().__init__()
-        
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.bias = config.bias
+
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
 
         self.flash = hasattr(nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -111,8 +111,20 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),                                  # layer_norm final
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
     
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def forward(self, idx: torch.Tensor, target: torch.Tensor=None) -> torch.Tensor:
         """GPT 根据输入的tokens预测下一个token
 
         Args:
@@ -139,8 +151,12 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
-        return logits
-
+        # calculate loss
+        loss = None
+        if target is not None:
+            # ignore_index=-1, 忽略掉pad的loss
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1), ignore_index=-1)  
+        return logits, loss
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
@@ -193,50 +209,5 @@ class GPT(nn.Module):
         return model
     
 
-if __name__ == '__main__':
-    # hyperparameters
-    device = 'cpu'
-    if torch.cuda.available():
-        device = 'cuda'
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = 'mps'
 
-    num_return_sequences = 5
-    max_length = 30
-
-    # model = GPT.from_pretrained('gpt2')
-    model = GPT(GPTConfig())
-    model.eval()
-    model = model.to(device)
-
-    import tiktoken
-    enc = tiktoken.get_encoding("gpt2")
-    tokens = enc.encode("Hello, I'm a language model.")
-    tokens = torch.tensor(tokens, dtype=torch.long)
-    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-    x: torch.Tensor = tokens.to(device)
-    
-    torch.manual_seed(0)
-    torch.cuda.manual_seed(0)
-    while x.size(1) < max_length:
-        with torch.no_grad():
-            logits = model(x)[:, -1, :]    # [B, vocab_size]
-            probs = F.softmax(logits, dim=-1)
-            
-            # topk sampling of 50 (huggingface pipeline 默认设置)
-            topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)   # [B, 50]
-            
-            # 从 samples 中按照概率随机抽取一个token
-            ix = torch.multinomial(topk_probs, num_samples=1)    # [B, 1]
-        
-            # gather the corresponding indices
-            xcol = torch.gather(topk_indices, dim=-1, index=ix)
-
-            # append to the sequence
-            x = torch.cat([x, xcol], dim=1)
-    
-    for i in range(num_return_sequences):
-        tokens = x[i][:max_length].tolist()
-        decoded = enc.decode(tokens)
-        print("> ", decoded)
 
