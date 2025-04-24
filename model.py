@@ -1,13 +1,14 @@
 import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+import inspect
 
 from dataclasses import dataclass
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch.optim import AdamW
 @dataclass
 class GPTConfig:
     block_size: int = 1024    # context size
@@ -25,6 +26,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1  # NOTE - 在 project layer 对 resiual layers 产生的权重进行缩放
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -44,6 +46,7 @@ class CausalSelfAttention(nn.Module):
 
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         self.flash = hasattr(nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -100,7 +103,7 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
     
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
 
@@ -119,7 +122,12 @@ class GPT(nn.Module):
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                # NOTE - 针对残差连接的数量进行标准化
+                # NOTE - 每一个 layer 对应 2 个残差连接
+                std *= (2 * self.config.n_layer)**-0.5 
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -135,7 +143,7 @@ class GPT(nn.Module):
         """
         # process inputs
         B, T = idx.size()   # batch size, sequence length
-        assert T < self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
         # forward the token and position embeddings
         # NOTE - 按照输入的 idx 所在设备处理, 如果 idx 设备与模型设备不一致, 则后续会报错
@@ -208,6 +216,32 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
     
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that requires grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        # create optim groups. Any parameters that is 2D dimensional will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},  # NOTE - 对二维矩阵进行 weight decay, 防止 over-fitting
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device != 'cpu' and device != 'mps'
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+
+        return optimizer
 
 
 
