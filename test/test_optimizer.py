@@ -1,7 +1,9 @@
 import torch
+import torch.nn.functional as F
 
 if __name__ == '__main__':
-    parameters = [torch.tensor([1, 2, 3, 4, 5]), torch.tensor([6, 7, 8])]
-    optimizer = torch.optim.AdamW(parameters, lr=1e-3)
-    for group in optimizer.param_groups:   # 参数组
-        print(group)
+    predicted = torch.tensor([[0.9, 0.7, 0.2]])
+    target = torch.tensor([[0.1, 0.1, 0.8]])
+
+    loss = F.cross_entropy(predicted, target)
+    print(loss)

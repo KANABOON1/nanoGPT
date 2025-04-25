@@ -41,8 +41,13 @@ if __name__ == '__main__':
     torch.manual_seed(1337)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
-        
-    train_loader = DataLoaderLite(B=16, T=1024)
+    
+    # NOTE - batch size 与所有训练有关的超参数高度相关
+    batch_size = 524288 # ~5M, beautiful number: 2^19
+    B, T = 16, 1024
+    assert batch_size % (B * T) == 0
+    grad_accum_steps: int = batch_size // (B * T)
+    train_loader = DataLoaderLite(B=B, T=T)
     
     # NOTE - A100-ampere: 使用 TF32 加速
     torch.set_float32_matmul_precision("high")  
@@ -61,55 +66,39 @@ if __name__ == '__main__':
     use_amp = True
     for step in range(max_steps):
         t0 = time.time()
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        
-        # NOTE - In this context, use automatic mixed precision: transfer some tensor to bf16, which is faster than fp32
-        # NOTE - 使用 bf16 而不使用 fp16, 因为 bf16 能够表示的范围比 fp16 更广, 不容易产生下溢问题
-        # NOTE - 下溢: 当小于小数所能表示的最小数字时, 会变为0
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp): 
-            logits, loss = model(x, y)
+
+        optimizer.zero_grad()
+        loss_accum = 0
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+
+            # NOTE - In this context, use automatic mixed precision: transfer some tensor to bf16, which is faster than fp32
+            # NOTE - 不改变模型本身的参数, 而是改变用于计算时的参数, 并且允许输出时低精度的
+            # NOTE - 使用 bf16 而不使用 fp16, 因为 bf16 能够表示的范围比 fp16 更广, 不容易产生下溢问题(下溢:当小于小数所能表示的最小数字时, 会变为0)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp): 
+                logits, loss = model(x, y)
+            
+            # let the gradient backward and accumulated per micro_step
+            # NOTE - scaling down the loss, 仅仅使用一个 object 的 loss
+            loss = loss / grad_accum_steps  
+            loss_accum += loss.detach()
+            loss.backward()
+
+        # NOTE - 裁剪梯度总范数, 使得总范数 <= max_norm, 防止梯度爆炸
+        # NOTE - 如果范数 cur_norm 超过 max_norm, 则对所有梯度进行缩放: 都乘以 max_norm / cur_norm
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  
         
         # backward 使用全精度
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr 
-        loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 裁剪总范数, 使得总范数 <= max_norm, 防止梯度爆炸
         optimizer.step()
-        optimizer.zero_grad()
 
         torch.cuda.synchronize()    # finish all the works that's scheduled to run
         t1 = time.time()
-        dt = (t1 - t0) * 1000
-        tokens_per_second = train_loader.B * train_loader.T / (t1 - t0)
+        dt = t1 - t0
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+        tokens_per_second = tokens_processed / dt
 
-        print(f"step {step} | loss = {loss.item()} | lr = {lr:.4e} | dt = {dt:.2f}ms | norm = {norm: .4f} | tokens_per_second = {tokens_per_second:.2f}")
-
-    # logits, loss = model(x, y)
-    
-    # print(logits.shape)
-    # print(loss)   # NOTE - loss = 10.8893, 大约为 - log(1 / vocab_size), 说明参数分布均匀, 模型初始化时输出的每一个vocab的概率几乎相等
-    # print(loss.shape)
-
-    # while x.size(1) < max_length:
-    #     with torch.no_grad():
-    #         logits = model(x)[:, -1, :]    # [B, vocab_size]
-    #         probs = F.softmax(logits, dim=-1)
-            
-    #         # topk sampling of 50 (huggingface pipeline 默认设置)
-    #         topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)   # [B, 50]
-            
-    #         # 从 samples 中按照概率随机抽取一个token
-    #         ix = torch.multinomial(topk_probs, num_samples=1)    # [B, 1]
-        
-    #         # gather the corresponding indices
-    #         xcol = torch.gather(topk_indices, dim=-1, index=ix)
-
-    #         # append to the sequence
-    #         x = torch.cat([x, xcol], dim=1)
-    
-    # for i in range(num_return_sequences):
-    #     tokens = x[i][:max_length].tolist()
-    #     decoded = enc.decode(tokens)
-    #     print("> ", decoded)
+        print(f"step {step} | loss = {loss_accum.item()} | lr = {lr:.4e} | dt = {1000 * dt:.2f}ms | norm = {norm: .4f} | tokens_per_second = {tokens_per_second:.2f}")

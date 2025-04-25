@@ -2,13 +2,13 @@ import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import inspect
-
 from dataclasses import dataclass
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024    # context size
@@ -70,8 +70,11 @@ class CausalSelfAttention(nn.Module):
             att: torch.Tensor = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
 
             # process attention scores
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))  # 变为负无穷, 经过 softmax 之后 attention score 变为0
             att = F.softmax(att, dim=-1)  # note: 必须先softmax再做dropout, 否则dropout会打乱原有的权重分布
+
+            # TODO - attention 应该有 dropout
+            # att = F.dropout(att, p=self.dropout, training=self.training)
 
             # values
             y = att @ v
@@ -239,7 +242,7 @@ class GPT(nn.Module):
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device != 'cpu' and device != 'mps'
         print(f"using fused AdamW: {use_fused}")
-        optimizer = AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        optimizer = AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)   # fused implementation
 
         return optimizer
 
