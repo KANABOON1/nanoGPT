@@ -2,9 +2,11 @@ import tiktoken
 import torch
 
 class DataLoaderLite:
-   def __init__(self, B: int, T: int):
+   def __init__(self, B: int, T: int, process_rank: int, num_processes: int):
       self.B = B
       self.T = T
+      self.process_rank = process_rank
+      self.num_processes = num_processes
 
       with open('data/tinyshakespeare.txt', 'r', encoding='utf-8') as f:
          data = f.read()
@@ -14,7 +16,7 @@ class DataLoaderLite:
       print(f"Load {len(self.tokens)} tokens.")
       print(f"1 epoch = {len(self.tokens) // (B * T)} batches.")
       
-      self.current_position = 0
+      self.current_position = B * T * process_rank
    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
       # get the current batch
       B, T = self.B, self.T
@@ -25,9 +27,9 @@ class DataLoaderLite:
       y = buf[1:].view(B, T) 
 
       # forward the current position
-      self.current_position += B * T
-      if self.current_position + B * T >= len(self.tokens):
-         self.current_position = 0
+      self.current_position += B * T * self.num_processes
+      if self.current_position + B * T * self.num_processes >= len(self.tokens):
+         self.current_position = B * T * self.process_rank
       
       return x, y
 

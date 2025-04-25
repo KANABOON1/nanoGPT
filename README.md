@@ -77,3 +77,10 @@ loss.backward()
 ### 2.3 compile the model
 
 ### 2.4 use beautiful numbers (e.g. $2^n$)
+
+### 2.5 Distributed Data Parallel
+- Data Parallel: 总共只有一个进程, master 节点收集到各个卡中计算的梯度, 取平均值之后更新其模型参数, 其他卡拉取 master 节点中的参数进行更新
+    - 负载不均衡: device[0] 负载大一些
+    - 通信开销与GPU数量线性相关: 假设有 K 个GPU, 完成一次通信需要$P/b$时间, 使用PS算法, 总共需要花费$T = 2(k-1)P/b$
+    - 单进程: 收到 python GIL 约束, 一个 python 进程只能使用一个 CPU kernel, 多线程并发时, 只能执行一个线程.
+
