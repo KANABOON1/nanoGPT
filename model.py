@@ -219,7 +219,7 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
     
-    def configure_optimizers(self, weight_decay, learning_rate, device):
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # start with all of the candidate parameters (that requires grad)
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
@@ -240,7 +240,7 @@ class GPT(nn.Module):
 
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device != 'cpu' and device != 'mps'
+        use_fused = fused_available and device_type != 'cpu' and device_type != 'mps'
         # print(f"using fused AdamW: {use_fused}")
         optimizer = AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)   # fused implementation
 

@@ -10,8 +10,13 @@ from dataloader import DataLoaderLite
 
 max_lr = 6e-4
 min_lr = 0.1 * max_lr
-warmup_steps = 10
-max_steps = 50
+# step = batch_num
+warmup_steps = 715  # 375 * 10^6 tokens in GPT3 / 2^19 = 715
+max_steps = 19073   # 10^10 / 2^19 (10^10 为训练数据, 总共有 10B tokens; 2^19 为 effective batch size (考虑 DDP))
+
+# NOTE - batch size 与所有训练有关的超参数高度相关
+batch_size = 524288 # effective batch size, ~5M, beautiful number: 2^19
+B, T = 16, 1024
 
 # NOTE - 虽然 torch 有相关的实现, 但是与其使用 black box, 也可以使用自己实现的东西
 def get_lr(step: int) -> float:
@@ -62,16 +67,13 @@ if __name__ == '__main__':
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
     
-    # NOTE - batch size 与所有训练有关的超参数高度相关
-    batch_size = 524288 # effective batch size, ~5M, beautiful number: 2^19
-    B, T = 16, 1024
     assert batch_size % (B * T * ddp_world_size) == 0
     grad_accum_steps: int = batch_size // (B * T * ddp_world_size)  # 每一个进程只需要 origin_accum_step / wordsize 个 accum_steps
     if master_process:
         print(f"Micro steps in each batch: {grad_accum_steps}")
     
     # NOTE - 需要确保不同的进程得到的训练数据不同, 否则会造成无意义的消耗(同一个 batch 中有多个进程得到了相同的 batch)
-    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
     
     # NOTE - A100-ampere: 使用 TF32 加速
     torch.set_float32_matmul_precision("high")  
