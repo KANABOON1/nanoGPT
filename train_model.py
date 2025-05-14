@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from model import GPT, GPTConfig
+from models.modeling_gpt2 import GPT, GPTConfig
 from dataloader import DataLoaderLite
 
 max_lr = 6e-4
@@ -35,7 +35,13 @@ def get_lr(step: int) -> float:
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
-    
+
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass    
 
 if __name__ == '__main__':
 
@@ -49,8 +55,8 @@ if __name__ == '__main__':
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
         ddp_world_size = int(os.environ['WORLD_SIZE'])
         device = f'cuda:{ddp_local_rank}'
-        torch.cuda.set_device(ddp_local_rank)
-        master_process = ddp_rank == 0       # 用于区分是否是主进程
+        torch.cuda.set_device(ddp_local_rank) 
+        master_process = ddp_rank == 0         # 用于区分是否是主进程
     else:
         ddp_rank = 0
         ddp_local_rank = 0
@@ -74,6 +80,7 @@ if __name__ == '__main__':
     
     # NOTE - 需要确保不同的进程得到的训练数据不同, 否则会造成无意义的消耗(同一个 batch 中有多个进程得到了相同的 batch)
     train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
+    val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
     
     # NOTE - A100-ampere: 使用 TF32 加速
     torch.set_float32_matmul_precision("high")  
@@ -82,7 +89,7 @@ if __name__ == '__main__':
     # 相比于原先的 GPT2(vacab_size=50257), vacab_size=50304 仅仅增加了一点 size(token embedding tensor)
     # 在优化时, 增加的部分 embedding 的概率将被优化接近 0 (例如Shakespeare数据集仅涉及到10000个单词, 剩下的40000个单词的输出概率接近于0)
     model: GPT = GPT(GPTConfig(vocab_size=50304))    
-    model.eval()
+    
     model = model.to(device)
     model = torch.compile(model)   # 静态编译model, 优化模型推理速度: 减少了 HBM 与 GPU 之间的差距
     if master_process:
@@ -98,9 +105,44 @@ if __name__ == '__main__':
     optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
     
     use_amp = True
-    for step in range(max_steps):
+    for step in range(max_steps):  
         t0 = time.time()
-
+        last_step = step == max_steps - 1
+        
+        # validation step
+        if step % 250 == 0 or last_step:
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():   # validation 不需要 grads
+                val_loss_accum = 0.0
+                val_loss_steps = 20
+                for _ in range(val_loss_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
+                        logits, loss = model(x, y)
+                    loss = loss / val_loss_steps
+                    val_loss_accum += loss.detach()
+            if ddp:
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            if master_process:
+                print(f"validation loss: {val_loss_accum.item():.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step}\t{val_loss_accum.item():.4f}\n")
+                
+                # save checkpoint after validation
+                if step > 0 and (step % 5000 == 0 or last_step):
+                    checkpoint_path = os.path.join(log_dir, f"checkpoint_{step}.pt")
+                    checkpoint = {
+                        "model": raw_model.state_dict(),
+                        "config": raw_model.config,
+                        "step": step,
+                        "val_loss": val_loss_accum.item()
+                    }
+                    torch.save(checkpoint, checkpoint_path)
+        
+        # training step - using gradient accumulation per batch
+        model.train()
         optimizer.zero_grad()
         loss_accum = 0
         for micro_step in range(grad_accum_steps):
@@ -123,7 +165,7 @@ if __name__ == '__main__':
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)  
             # NOTE - DDP 模式下 (require_backward_grad_sync == True), 每一个进程在 loss.backward() 时都会触发梯度的 AllReduce 操作
             # 该操作使用 Ring-AllReduce 对每一个进程的梯度进行同步, 确保每一个进程上的梯度相同
-            # 最后再每一个进程单独执行 optimizer.step().
+            # 最后每一个进程单独执行 optimizer.step().
             loss.backward()   
         
         if ddp:
